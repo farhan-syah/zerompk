@@ -46,7 +46,7 @@ pub struct Nested {
 
 impl ToMessagePack for Nested {
     fn write<W: zerompk::Write>(&self, writer: &mut W) -> Result<(), zerompk::Error> {
-        writer.write_byte(0x94)?; // Array of 4 elements
+        writer.write_array_len(4)?;
         writer.write_string(&self.name)?;
         self.p1.write(writer)?;
         self.p2.write(writer)?;

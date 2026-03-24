@@ -2,8 +2,8 @@ use proc_macro::TokenStream;
 
 use quote::{format_ident, quote};
 use syn::{
-    Data, DataEnum, DataStruct, DeriveInput, Field, Fields, Generics, Ident, Lit, LitByteStr,
-    LitInt, LitStr, Result, Type, Variant, parse_macro_input, parse_quote, spanned::Spanned,
+    Data, DataEnum, DataStruct, DeriveInput, Field, Fields, Generics, Ident, Lit, LitInt, LitStr,
+    Result, Type, Variant, parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -107,31 +107,6 @@ fn msgpack_u64_size(v: u64) -> usize {
         0x1_0000..=0xffff_ffff => 5,
         _ => 9,
     }
-}
-
-fn encode_msgpack_string_bytes(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(msgpack_string_size(s));
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-
-    match len {
-        0..=31 => out.push(0xa0 | (len as u8)),
-        32..=255 => {
-            out.push(0xd9);
-            out.push(len as u8);
-        }
-        256..=65535 => {
-            out.push(0xda);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
-        }
-        _ => {
-            out.push(0xdb);
-            out.extend_from_slice(&(len as u32).to_be_bytes());
-        }
-    }
-
-    out.extend_from_slice(bytes);
-    out
 }
 
 fn pack_u64_le_chunk(bytes: &[u8]) -> u64 {
@@ -996,10 +971,6 @@ fn expand_map_struct(data: &DataStruct) -> Result<ImplBody> {
         .collect();
     let tys: Vec<_> = field_indices.iter().map(|i| tys_all[*i].clone()).collect();
     let key_lens: Vec<_> = key_lits.iter().map(|k| k.value().len()).collect();
-    let key_write_bytes: Vec<_> = key_lits
-        .iter()
-        .map(|k| LitByteStr::new(&encode_msgpack_string_bytes(&k.value()), k.span()))
-        .collect();
     let slots: Vec<_> = names
         .iter()
         .map(|n| format_ident!("__slot_{}", n))
@@ -1042,7 +1013,7 @@ fn expand_map_struct(data: &DataStruct) -> Result<ImplBody> {
     let write = quote! {
         writer.write_map_len(#count)?;
         #(
-            writer.write_bytes(#key_write_bytes)?;
+            writer.write_string(#key_lits)?;
             #value_writes
         )*
         Ok(())
@@ -1497,12 +1468,6 @@ fn build_enum_variant_payload(
                     let active_tys: Vec<_> =
                         field_indices.iter().map(|i| tys[*i].clone()).collect();
                     let key_lens: Vec<_> = key_lits.iter().map(|k| k.value().len()).collect();
-                    let key_write_bytes: Vec<_> = key_lits
-                        .iter()
-                        .map(|k| {
-                            LitByteStr::new(&encode_msgpack_string_bytes(&k.value()), k.span())
-                        })
-                        .collect();
                     let key_sizes: Vec<_> = key_lits
                         .iter()
                         .map(|k| msgpack_string_size(&k.value()))
@@ -1558,7 +1523,7 @@ fn build_enum_variant_payload(
                     let write_payload = quote! {
                         writer.write_map_len(#count)?;
                         #(
-                            writer.write_bytes(#key_write_bytes)?;
+                            writer.write_string(#key_lits)?;
                             #active_write_parts
                         )*
                     };
