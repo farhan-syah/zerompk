@@ -8,8 +8,6 @@ mod write;
 
 use alloc::vec::Vec;
 
-use crate::write::VecWriter;
-
 pub use error::{Error, Result};
 pub use read::{Read, Tag};
 pub use write::Write;
@@ -42,13 +40,13 @@ pub trait ToMessagePack {
 }
 
 /// Deserializes a value of type `T` from a MessagePack-encoded byte slice.
-/// 
+///
 /// ## Errors
-/// 
+///
 /// Deserialization can fail if `T`'s implementation of `FromMessagePack` returns an error.
 ///
 /// ## Examples
-/// 
+///
 /// ```rust
 /// #[derive(zerompk::FromMessagePack)]
 /// struct Point {
@@ -91,7 +89,7 @@ pub fn from_msgpack<'a, T: FromMessagePack<'a>>(data: &'a [u8]) -> Result<T> {
 /// }
 /// ```
 pub fn to_msgpack_vec<T: ToMessagePack>(value: &T) -> Result<Vec<u8>> {
-    let mut writer = VecWriter::new();
+    let mut writer = write::VecWriter::new();
     value.write(&mut writer)?;
     Ok(writer.into_vec())
 }
@@ -102,7 +100,7 @@ pub fn to_msgpack_vec<T: ToMessagePack>(value: &T) -> Result<Vec<u8>> {
 ///
 /// Serialization can fail if `T`'s implementation of `ToMessagePack` returns an error,
 /// or if the provided buffer is too small.
-/// 
+///
 /// ## Examples
 ///
 /// ```rust
@@ -124,7 +122,7 @@ pub fn to_msgpack_vec<T: ToMessagePack>(value: &T) -> Result<Vec<u8>> {
 pub fn to_msgpack<T: ToMessagePack>(value: &T, buf: &mut [u8]) -> Result<usize> {
     let mut writer = write::SliceWriter::new(buf);
     value.write(&mut writer)?;
-    Ok(writer.written())
+    Ok(writer.position())
 }
 
 /// Serializes a value of type `T` into the I/O stream.
@@ -150,7 +148,8 @@ pub fn to_msgpack<T: ToMessagePack>(value: &T, buf: &mut [u8]) -> Result<usize> 
 /// ```
 #[cfg(feature = "std")]
 pub fn write_msgpack<T: ToMessagePack, W: std::io::Write>(writer: &mut W, value: &T) -> Result<()> {
-    value.write(writer)
+    let mut io_writer = write::IOWriter::new(writer);
+    value.write(&mut io_writer)
 }
 
 /// Deserializes a value of type `T` from the I/O stream.

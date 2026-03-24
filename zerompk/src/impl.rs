@@ -342,7 +342,11 @@ impl<'a, T: FromMessagePack<'a>> FromMessagePack<'a> for alloc::vec::Vec<T> {
 impl<T: ToMessagePack> ToMessagePack for alloc::vec::Vec<T> {
     #[inline(always)]
     fn write<W: Write>(&self, writer: &mut W) -> crate::Result<()> {
-        writer.write_array_from_slice(self)
+        writer.write_array_len(self.len())?;
+        for item in self {
+            item.write(writer)?;
+        }
+        Ok(())
     }
 }
 
