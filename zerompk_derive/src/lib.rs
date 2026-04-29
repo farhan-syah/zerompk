@@ -42,11 +42,13 @@ enum Repr {
 struct TypeConfig {
     repr: Option<Repr>,
     c_enum: bool,
+    allow_unknown_fields: bool,
 }
 
 fn parse_type_config_from_attrs(attrs: &[syn::Attribute]) -> Result<TypeConfig> {
     let mut repr = None;
     let mut c_enum = false;
+    let mut allow_unknown_fields = false;
 
     for attr in attrs {
         if !attr.path().is_ident("msgpack") {
@@ -75,13 +77,25 @@ fn parse_type_config_from_attrs(attrs: &[syn::Attribute]) -> Result<TypeConfig> 
                 }
                 c_enum = true;
                 Ok(())
+            } else if meta.path.is_ident("allow_unknown_fields") {
+                if allow_unknown_fields {
+                    return Err(meta.error("duplicate `allow_unknown_fields` attribute"));
+                }
+                allow_unknown_fields = true;
+                Ok(())
             } else {
-                Err(meta.error("expected `array`, `map`, `c_enum`, or `key = ...`"))
+                Err(meta.error(
+                    "expected `array`, `map`, `c_enum`, `allow_unknown_fields`, or `key = ...`",
+                ))
             }
         })?;
     }
 
-    Ok(TypeConfig { repr, c_enum })
+    Ok(TypeConfig {
+        repr,
+        c_enum,
+        allow_unknown_fields,
+    })
 }
 
 fn add_trait_bounds(mut generics: Generics, kind: DeriveKind) -> Generics {
@@ -811,9 +825,15 @@ fn expand(input: DeriveInput, kind: DeriveKind) -> Result<proc_macro2::TokenStre
             }
 
             let repr = type_cfg.repr.unwrap_or(Repr::Array);
+            if type_cfg.allow_unknown_fields && repr == Repr::Array {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "`allow_unknown_fields` is only meaningful with `#[msgpack(map)]`; arrays have no field names",
+                ));
+            }
             match repr {
                 Repr::Array => expand_array_struct(&data)?,
-                Repr::Map => expand_map_struct(&data)?,
+                Repr::Map => expand_map_struct(&data, type_cfg.allow_unknown_fields)?,
             }
         }
         Data::Enum(data) => {
@@ -821,6 +841,12 @@ fn expand(input: DeriveInput, kind: DeriveKind) -> Result<proc_macro2::TokenStre
                 return Err(syn::Error::new(
                     ident.span(),
                     "enum itself is always encoded as [tag, payload], so top-level #[msgpack(array/map)] is not allowed",
+                ));
+            }
+            if type_cfg.allow_unknown_fields {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "`allow_unknown_fields` is not supported on enums; place it on individual map-mode struct variants is also not yet supported",
                 ));
             }
 
@@ -903,34 +929,16 @@ fn expand_array_struct(data: &DataStruct) -> Result<ImplBody> {
                 .collect::<Result<_>>()?;
             let field_index_by_slot = build_named_array_slots(fields, &field_configs)?;
 
-            // In array mode, `#[msgpack(default)]` is only safe at trailing
-            // positions: anything after a defaulted slot shifts on evolution.
-            // Reject mid-struct defaults; user must move the field to the end
-            // or add `#[msgpack(map)]`.
-            {
-                let mut saw_default = false;
-                for slot in field_index_by_slot.iter() {
-                    match slot {
-                        Some(i) => {
-                            let cfg = &field_configs[*i];
-                            if cfg.default {
-                                saw_default = true;
-                            } else if saw_default {
-                                return Err(syn::Error::new(
-                                    fields.named[*i].span(),
-                                    "`#[msgpack(default)]` in array mode must be trailing; move this field to the end or use `#[msgpack(map)]`",
-                                ));
-                            }
-                        }
-                        None => {
-                            if saw_default {
-                                return Err(syn::Error::new(
-                                    fields.named.span(),
-                                    "`#[msgpack(default)]` in array mode must be trailing; use `#[msgpack(map)]`",
-                                ));
-                            }
-                        }
-                    }
+            // `#[msgpack(default)]` is only honored in map mode. Arrays have
+            // no field names, so silently accepting shorter/longer arrays
+            // hides corruption rather than evolving schema. Force the user
+            // to opt into map representation explicitly.
+            for (i, cfg) in field_configs.iter().enumerate() {
+                if cfg.default {
+                    return Err(syn::Error::new(
+                        fields.named[i].span(),
+                        "`#[msgpack(default)]` is only supported with `#[msgpack(map)]`; array representation has no field names so missing values cannot be detected safely",
+                    ));
                 }
             }
 
@@ -987,85 +995,25 @@ fn expand_array_struct(data: &DataStruct) -> Result<ImplBody> {
                 Ok(())
             };
 
-            let any_field_has_default = field_configs.iter().any(|c| c.default);
-
-            let read = if !any_field_has_default {
-                // Strict path: bit-identical to upstream 0.4.1.
-                if is_dense_sequential {
-                    let direct_fields: Vec<_> = names
-                        .iter()
-                        .zip(tys.iter())
-                        .zip(field_configs.iter())
-                        .map(|((name, ty), cfg)| {
-                            let read_expr = build_read_expr(ty, Some(cfg));
-                            quote! { #name: #read_expr }
-                        })
-                        .collect();
-
-                    quote! {
-                        reader.check_array_len(#array_len)?;
-                        Ok(Self { #( #direct_fields ),* })
-                    }
-                } else {
-                    quote! {
-                        reader.check_array_len(#array_len)?;
-                        #( #read_slots )*
-                        Ok(Self { #( #init_fields ),* })
-                    }
-                }
-            } else {
-                // Tolerant array path: accepts arrays shorter than the full schema,
-                // defaulting any trailing slots whose fields are marked
-                // `#[msgpack(default)]`. Arrays longer than expected are also
-                // tolerated — trailing extra values are skipped.
-                let tolerant_slot_reads: Vec<_> = field_index_by_slot
+            let read = if is_dense_sequential {
+                let direct_fields: Vec<_> = names
                     .iter()
-                    .enumerate()
-                    .map(|(slot_idx, slot)| match slot {
-                        Some(i) => {
-                            let name = &names[*i];
-                            let ty = &tys[*i];
-                            let cfg = &field_configs[*i];
-                            let read_expr = build_read_expr(ty, Some(cfg));
-                            let default_expr = if cfg.default {
-                                if let Some(path) = &cfg.default_path {
-                                    quote! { #path() }
-                                } else {
-                                    quote! { <#ty as ::core::default::Default>::default() }
-                                }
-                            } else {
-                                quote! {
-                                    return Err(::zerompk::Error::ArrayLengthMismatch {
-                                        expected: #array_len,
-                                        actual: __array_len,
-                                    })
-                                }
-                            };
-                            quote! {
-                                let #name: #ty = if #slot_idx < __array_len {
-                                    #read_expr
-                                } else {
-                                    #default_expr
-                                };
-                            }
-                        }
-                        None => quote! {
-                            if #slot_idx < __array_len {
-                                reader.read_nil()?;
-                            }
-                        },
+                    .zip(tys.iter())
+                    .zip(field_configs.iter())
+                    .map(|((name, ty), cfg)| {
+                        let read_expr = build_read_expr(ty, Some(cfg));
+                        quote! { #name: #read_expr }
                     })
                     .collect();
 
                 quote! {
-                    let __array_len = reader.read_array_len()?;
-                    #( #tolerant_slot_reads )*
-                    // Skip any trailing values the writer emitted beyond our schema.
-                    if __array_len > #array_len {
-                        for _ in #array_len..__array_len {
-                            reader.skip_value()?;
-                        }
-                    }
+                    reader.check_array_len(#array_len)?;
+                    Ok(Self { #( #direct_fields ),* })
+                }
+            } else {
+                quote! {
+                    reader.check_array_len(#array_len)?;
+                    #( #read_slots )*
                     Ok(Self { #( #init_fields ),* })
                 }
             };
@@ -1196,7 +1144,7 @@ fn expand_array_struct(data: &DataStruct) -> Result<ImplBody> {
     }
 }
 
-fn expand_map_struct(data: &DataStruct) -> Result<ImplBody> {
+fn expand_map_struct(data: &DataStruct, allow_unknown_fields: bool) -> Result<ImplBody> {
     let fields = match &data.fields {
         Fields::Named(fields) => fields,
         Fields::Unnamed(_) | Fields::Unit => {
@@ -1281,8 +1229,19 @@ fn expand_map_struct(data: &DataStruct) -> Result<ImplBody> {
 
     let any_field_has_default = field_configs.iter().any(|c| c.default);
 
-    let read = if !any_field_has_default {
-        // Strict path: preserves 0.4.1 fast-fail behavior bit-for-bit.
+    // Three decoding modes, controlled by orthogonal opt-ins:
+    //
+    //   defaults  unknown        decoder behavior
+    //   --------  -------------  -----------------------------------------
+    //   no        deny  (default) check_map_len(N), every key required
+    //   yes       deny           read_map_len, fill missing, error on unknown
+    //   no        allow          read_map_len, every key required, skip unknown
+    //   yes       allow          read_map_len, fill missing, skip unknown
+    //
+    // Strict mode preserves 0.4.1 codegen byte-for-byte. The other two modes
+    // share one tolerant skeleton parameterized by what to do with missing
+    // keys (default vs error) and unknown keys (skip vs error).
+    let read = if !any_field_has_default && !allow_unknown_fields {
         quote! {
             '__zerompk_read_map: {
             reader.check_map_len(#count)?;
@@ -1311,10 +1270,19 @@ fn expand_map_struct(data: &DataStruct) -> Result<ImplBody> {
             }
         }
     } else {
-        // Tolerant path: struct opted into evolution via per-field `default`.
-        // Accepts maps of any length, skips unknown keys, fills missing keys
-        // with their declared default.
-        let unknown_arm = quote! { _ => { reader.skip_value()?; } };
+        let unknown_arm = if allow_unknown_fields {
+            quote! { _ => { reader.skip_value()?; } }
+        } else {
+            // Surface the offending key so users can diagnose schema drift.
+            quote! {
+                _ => {
+                    let __key_str = ::core::str::from_utf8(__key_bytes)
+                        .unwrap_or("<non-utf8>")
+                        .to_string();
+                    break '__zerompk_read_map Err(::zerompk::Error::KeyNotFound(__key_str));
+                }
+            }
+        };
 
         let key_dispatch_tolerant = quote! {
             let __matched_idx: usize = (|| -> ::zerompk::Result<usize> {
@@ -1567,6 +1535,24 @@ fn build_enum_variant_payload(
     proc_macro2::TokenStream,
 )> {
     let v_ident = &variant.ident;
+
+    // `#[msgpack(default)]` on enum-variant fields is currently a no-op in
+    // codegen — silently accepting it would let users write code that looks
+    // like it does schema evolution but doesn't. Reject loudly.
+    let variant_field_iter: Box<dyn Iterator<Item = &Field>> = match &variant.fields {
+        Fields::Named(f) => Box::new(f.named.iter()),
+        Fields::Unnamed(f) => Box::new(f.unnamed.iter()),
+        Fields::Unit => Box::new(std::iter::empty()),
+    };
+    for field in variant_field_iter {
+        let fc = parse_field_config(field)?;
+        if fc.default {
+            return Err(syn::Error::new(
+                field.span(),
+                "`#[msgpack(default)]` is not supported on enum-variant fields",
+            ));
+        }
+    }
 
     match &variant.fields {
         Fields::Unit => {
