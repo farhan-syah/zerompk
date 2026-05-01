@@ -3,7 +3,6 @@
 //! interaction. These two opt-ins are intentionally orthogonal.
 
 use zerompk::{FromMessagePack, ToMessagePack};
-use zerompk_derive::{FromMessagePack, ToMessagePack};
 
 fn encode<T: ToMessagePack>(value: &T) -> Vec<u8> {
     zerompk::to_msgpack_vec(value).unwrap()
