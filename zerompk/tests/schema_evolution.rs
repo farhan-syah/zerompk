@@ -3,6 +3,9 @@
 //! interaction. These two opt-ins are intentionally orthogonal.
 
 use zerompk::{FromMessagePack, ToMessagePack};
+use zerompk_derive::{
+    FromMessagePack as DeriveFromMessagePack, ToMessagePack as DeriveToMessagePack,
+};
 
 fn encode<T: ToMessagePack>(value: &T) -> Vec<u8> {
     zerompk::to_msgpack_vec(value).unwrap()
@@ -16,7 +19,7 @@ fn decode<'a, T: FromMessagePack<'a>>(bytes: &'a [u8]) -> Result<T, zerompk::Err
 // V1 schema (writer side): the "old" version of a message.
 // ---------------------------------------------------------------------------
 
-#[derive(ToMessagePack, FromMessagePack, Debug, PartialEq)]
+#[derive(DeriveToMessagePack, DeriveFromMessagePack, Debug, PartialEq)]
 #[msgpack(map)]
 struct V1 {
     a: i32,
@@ -28,7 +31,7 @@ struct V1 {
 // This is the "I added a new field" evolution direction.
 // ---------------------------------------------------------------------------
 
-#[derive(FromMessagePack, Debug, PartialEq)]
+#[derive(DeriveFromMessagePack, Debug, PartialEq)]
 #[msgpack(map)]
 struct V2DefaultsOnly {
     a: i32,
@@ -49,7 +52,7 @@ fn defaults_fill_missing_keys() {
 fn defaults_alone_still_reject_unknown_keys() {
     // Writer emits an extra unknown key `z`; reader has defaults but not
     // `allow_unknown_fields`. Decode must fail loudly.
-    #[derive(ToMessagePack)]
+    #[derive(DeriveToMessagePack)]
     #[msgpack(map)]
     struct WithExtra {
         a: i32,
@@ -69,7 +72,7 @@ fn defaults_alone_still_reject_unknown_keys() {
 // still error. This is the "I removed a field" evolution direction.
 // ---------------------------------------------------------------------------
 
-#[derive(FromMessagePack, Debug, PartialEq)]
+#[derive(DeriveFromMessagePack, Debug, PartialEq)]
 #[msgpack(map, allow_unknown_fields)]
 struct V0AllowUnknownOnly {
     a: i32,
@@ -86,7 +89,7 @@ fn allow_unknown_skips_extra_keys() {
 #[test]
 fn allow_unknown_alone_still_requires_all_keys() {
     // Writer is missing key `a`; reader allows unknowns but `a` has no default.
-    #[derive(ToMessagePack)]
+    #[derive(DeriveToMessagePack)]
     #[msgpack(map)]
     struct OnlyB {
         b: i32,
@@ -101,7 +104,7 @@ fn allow_unknown_alone_still_requires_all_keys() {
 // unknown keys.
 // ---------------------------------------------------------------------------
 
-#[derive(FromMessagePack, Debug, PartialEq)]
+#[derive(DeriveFromMessagePack, Debug, PartialEq)]
 #[msgpack(map, allow_unknown_fields)]
 struct VFull {
     a: i32,
@@ -126,7 +129,7 @@ fn forty_two() -> i32 {
     42
 }
 
-#[derive(FromMessagePack, Debug, PartialEq)]
+#[derive(DeriveFromMessagePack, Debug, PartialEq)]
 #[msgpack(map)]
 struct V2DefaultPath {
     a: i32,
@@ -149,7 +152,7 @@ fn default_path_invokes_named_function() {
 
 #[test]
 fn strict_default_rejects_missing_key() {
-    #[derive(ToMessagePack)]
+    #[derive(DeriveToMessagePack)]
     #[msgpack(map)]
     struct OnlyA {
         a: i32,
@@ -162,7 +165,7 @@ fn strict_default_rejects_missing_key() {
 
 #[test]
 fn strict_default_rejects_extra_key() {
-    #[derive(ToMessagePack)]
+    #[derive(DeriveToMessagePack)]
     #[msgpack(map)]
     struct WithExtra {
         a: i32,
@@ -181,7 +184,7 @@ fn strict_default_rejects_extra_key() {
 
 #[test]
 fn round_trip_preserves_values() {
-    #[derive(ToMessagePack, FromMessagePack, Debug, PartialEq)]
+    #[derive(DeriveToMessagePack, DeriveFromMessagePack, Debug, PartialEq)]
     #[msgpack(map, allow_unknown_fields)]
     struct V {
         a: i32,
